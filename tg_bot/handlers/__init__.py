@@ -6,6 +6,8 @@ from .shops import register_shops_handlers
 from .subscription import register_subscription_handlers
 from .admin import register_admin_handlers
 from .support import register_support_handlers
+from .telegram_payments import register_telegram_payment_handlers
+
 def register_all_handlers(dp):
     register_start_handlers(dp)
     register_settings_handlers(dp)
@@ -15,3 +17,4 @@ def register_all_handlers(dp):
     register_subscription_handlers(dp)
     register_admin_handlers(dp)
     register_support_handlers(dp)
+    register_telegram_payment_handlers(dp)

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import sessionmaker
 from tg_bot.models.DBSM import engine, User, Shop
 from tg_bot.handlers.pnl import generate_pnl_excel_report
+from tg_bot.services.wb_api import fetch_report_detail_by_period
 from aiogram import Bot
 import os
 
@@ -85,13 +86,24 @@ class ReportScheduler:
                         logger.warning(f"Магазин не найден для пользователя {user.telegram_id}")
                         continue
                     
+                    # Получаем данные напрямую из API
+                    loop = asyncio.get_event_loop()
+                    full_data = await loop.run_in_executor(
+                        None,
+                        fetch_report_detail_by_period,
+                        shop.api_token,
+                        start_date,
+                        end_date
+                    )
+                    
                     # Генерируем отчет
                     wb = await generate_pnl_excel_report(
                         shop.id,
                         shop.api_token,
                         start_date,
                         end_date,
-                        shop.name
+                        shop.name,
+                        full_data
                     )
                     
                     if wb:

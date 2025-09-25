@@ -93,13 +93,20 @@ class Payment(Base):
     __tablename__ = 'payments'
 
     id = Column(Integer, primary_key=True)
-    account_id = Column(Integer)
-    amount = Column(Integer)
-    months = Column(Integer)
-    tarrif = Column(String(20), default='zero')  # zero/basic/extended
-    payment_id = Column(String(255))
-    status = Column(String(20), default='pending')  # pending/completed/failed
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    amount = Column(Integer, nullable=False)
+    currency = Column(String(3), default='RUB')
+    status = Column(String(20), default='PENDING')  # PENDING/SUCCESS/FAILED/CANCELLED
+    payment_method = Column(String(20), default='tinkoff')  # tinkoff/telegram
+    telegram_payment_id = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=func.now())
+    paid_at = Column(DateTime, nullable=True)
+    
+    # Для обратной совместимости
+    account_id = Column(Integer, nullable=True)
+    months = Column(Integer, nullable=True)
+    tarrif = Column(String(20), default='zero')  # zero/basic/extended
+    payment_id = Column(String(255), nullable=True)
 
 
 class Order(Base):
@@ -176,7 +183,7 @@ class RegularExpense(Base):
 
 class OneTimeExpense(Base):
     __tablename__ = "one_time_expenses"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     shop_id = Column(Integer, ForeignKey("shops.id"), nullable=False)
     amount = Column(Float, nullable=False)
@@ -185,5 +192,25 @@ class OneTimeExpense(Base):
     created_at = Column(DateTime, server_default=func.now())
     
     shop = relationship("Shop", back_populates="one_time_expenses")
+
+
+class WBCacheData(Base):
+    __tablename__ = "wb_cache_data"
+
+    id = Column(Integer, primary_key=True, index=True)
+    shop_id = Column(Integer, ForeignKey("shops.id"), nullable=False)
+    api_token = Column(String, nullable=False)  # Хеш API токена для идентификации
+    cache_type = Column(String, nullable=False)  # 'orders', 'sales', 'finance'
+    data = Column(JSON, nullable=False)  # Кэшированные данные
+    cache_timestamp = Column(DateTime, nullable=False)  # Время создания кэша
+    period_start = Column(DateTime, nullable=False)  # Начало периода кэша
+    period_end = Column(DateTime, nullable=False)  # Конец периода кэша
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, onupdate=func.now())
+    
+    # Индекс для быстрого поиска по shop_id и cache_type
+    __table_args__ = (
+        {'sqlite_autoincrement': True}
+    )
 
 Base.metadata.create_all(bind=engine)

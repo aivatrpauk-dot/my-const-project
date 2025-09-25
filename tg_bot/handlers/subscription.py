@@ -51,10 +51,23 @@ class ActivityMiddleware(BaseMiddleware):
 
 logger = logging.getLogger(__name__)
 
-# Настройки Tinkoff Kassa (должны быть в .env)
-TINKOFF_TERMINAL_KEY = os.getenv("TINKOFF_TERMINAL_KEY")
-TINKOFF_PASSWORD = os.getenv("TINKOFF_PASSWORD")
+# Настройки Tinkoff Kassa
 TINKOFF_API_URL = "https://securepay.tinkoff.ru/v2"
+
+# Функция для получения конфигурации Tinkoff
+def get_tinkoff_config():
+    from dataclasses import dataclass
+    
+    @dataclass
+    class TinkoffConfig:
+        terminal_key: str
+        password: str
+    
+    # Данные Tinkoff API (встроены в код)
+    return TinkoffConfig(
+        terminal_key="1749885008651",
+        password="YBla2Zf$iQYwWuSU"  # Правильный пароль
+    )
 
 # Статусы платежей Tinkoff
 STATUS_DESCRIPTION = {
@@ -73,21 +86,57 @@ STATUS_DESCRIPTION = {
 
 # Генерация токена для Tinkoff API
 def generate_token(data, password):
-    params = []
-    for key, value in data.items():
-        if not isinstance(value, (dict, list)):
-            params.append({key: value})
-    params.append({"Password": password})
-    sorted_params = sorted(params, key=lambda x: list(x.keys())[0])
-    concatenated = ''.join(str(list(param.values())[0]) for param in sorted_params)
-    return hashlib.sha256(concatenated.encode('utf-8')).hexdigest()
+    # Создаем копию данных и добавляем пароль
+    token_data = data.copy()
+    token_data["Password"] = password
+    
+    # Сортируем параметры по алфавиту
+    sorted_params = sorted(token_data.items(), key=lambda x: x[0])
+    
+    # Объединяем значения в строку
+    concatenated = ''.join(str(value) for key, value in sorted_params)
+    
+    # Создаем SHA256 хеш
+    token = hashlib.sha256(concatenated.encode('utf-8')).hexdigest()
+    
+    logger.info(f"Token generation - concatenated string: {concatenated}")
+    logger.info(f"Token generation - final token: {token}")
+    
+    return token
 
 
 # Проверка активной подписки
 def check_subscription(user):
     if not user:
         return False
-    return user.subscription_end and user.subscription_end > datetime.now()
+    
+    # Проверяем основную подписку
+    if user.subscription_end and user.subscription_end > datetime.now():
+        return True
+    
+    # Проверяем активные платежи через ЮKassa (Telegram Payments)
+    session = sessionmaker(bind=engine)()
+    try:
+        from tg_bot.models import Payment
+        current_time = datetime.utcnow()
+        
+        # Ищем успешные платежи за последние 30 дней
+        active_payment = session.query(Payment).filter(
+            Payment.user_id == user.id,
+            Payment.payment_method == 'telegram',
+            Payment.status == 'SUCCESS',
+            Payment.paid_at >= (current_time - timedelta(days=30))
+        ).first()
+        
+        if active_payment:
+            return True
+            
+    except Exception as e:
+        print(f"Error checking ЮKassa payments: {e}")
+    finally:
+        session.close()
+    
+    return False
 
 
 async def subscription_callback(callback: types.CallbackQuery):
@@ -111,12 +160,8 @@ async def subscription_callback(callback: types.CallbackQuery):
             text = (
                 "🔒 <b>Подписка ProfitBee Premium</b>\n\n"
                 "💡 Получите полный доступ к возможностям бота:\n"
-                "• Расчёт P&L и рентабельности\n"
-                "• Персональные рекомендации\n"
-                "• Расширенная аналитика\n"
-                "• Симулятор сценариев\n\n"
-                "💰 Стоимость: 990 руб./месяц\n"
-                "🛒 Первые 14 дней - бесплатно!"
+                "💰 Стоимость: 299 руб./месяц\n"
+                "🛒 Первые 3 дня - бесплатно!"
             )
             keyboard = InlineKeyboardMarkup(row_width=1)
             if not user.is_trial_used:
@@ -150,13 +195,13 @@ async def activate_trial_callback(callback: types.CallbackQuery):
 
 
         user.subscription_start = datetime.now()
-        user.subscription_end = datetime.now() + timedelta(days=140000)
+        user.subscription_end = datetime.now() + timedelta(days=3)
         user.is_trial_used = True
         session.commit()
 
         text = (
             "🎉 <b>Пробный период активирован!</b>\n\n"
-            f"Теперь у вас есть 14 дней бесплатного доступа ко всем функциям бота.\n"
+            f"Теперь у вас есть 3 дня бесплатного доступа ко всем функциям бота.\n"
             f"Окончание подписки: {user.subscription_end.strftime('%d.%m.%Y')}"
         )
         keyboard = InlineKeyboardMarkup()
@@ -178,67 +223,61 @@ async def buy_subscription_callback(callback: types.CallbackQuery):
             await callback.answer("❌ Пользователь не найден!", show_alert=True)
             return
 
-        # Создаем платеж в Tinkoff
-        amount = 99000  # 499 рублей в копейках
-        order_id = str(random.randint(100000, 1000000000))
-        description = "Подписка JustProfit Premium на 1 месяц"
-
-        token_data = {
-            "TerminalKey": TINKOFF_TERMINAL_KEY,
-            "Amount": amount,
-            "OrderId": order_id,
-            "Description": description
-        }
-        token = generate_token(token_data, TINKOFF_PASSWORD)
-
-        async with aiohttp.ClientSession() as http_session:
-            response = await http_session.post(
-                f"{TINKOFF_API_URL}/Init",
-                json={
-                    "TerminalKey": TINKOFF_TERMINAL_KEY,
-                    "Amount": amount,
-                    "OrderId": order_id,
-                    "Description": description,
-                    "Token": token
-                },
-                headers={"Content-Type": "application/json"}
-            )
-            data = await response.json()
-
-        if not data.get('Success', False):
-            error = data.get('Message', 'Неизвестная ошибка')
-            await callback.answer(f"❌ Ошибка: {error}", show_alert=True)
-            return
-
-        # Сохраняем платеж в БД
-        payment = Payment(
-            account_id=user.id,
-            amount=amount,
-            payment_id=data['PaymentId'],
-            status=data['Status']
+        text = (
+            '💳 <b>Выберите способ оплаты</b>\n\n'
+            'Доступные способы оплаты:\n'
+            '• Telegram Payments (рекомендуется)\n'
+            '• Тинькофф Касса\n\n'
+            '💰 Стоимость: 299₽/месяц'
         )
-        session.add(payment)
-        session.commit()
-
-        # Формируем интерфейс оплаты
+        
         keyboard = InlineKeyboardMarkup(row_width=1)
         keyboard.add(
-            InlineKeyboardButton("💳 Оплатить онлайн", url=data['PaymentURL']),
-            InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment:{payment.id}"),
+            InlineKeyboardButton("💳 Telegram Payments", callback_data="telegram_payment_menu"),
+            InlineKeyboardButton("🏦 Тинькофф Касса", callback_data="tinkoff_payment_menu"),
+            InlineKeyboardButton("🎁 Демо-подписка", callback_data="activate_demo_subscription"),
             InlineKeyboardButton("🔙 Назад", callback_data="subscription")
         )
-
-        text = (
-            '💳 <b>Оформление подписки</b>\n\n'
-            'Для оплаты подписки нажмите кнопку "Оплатить онлайн".\n'
-            'После успешной оплаты нажмите «Проверить оплату».\n\n'
-            '💰 Стоимость: 499 руб./месяц'
-        )
+        
         await callback.message.edit_text(text, reply_markup=keyboard)
 
     except Exception as e:
         logger.error(f"Payment creation error: {e}")
         await callback.answer("⚠️ Ошибка создания платежа", show_alert=True)
+    finally:
+        session.close()
+
+
+# Добавляем функцию для демо-подписки
+async def activate_demo_subscription_callback(callback: types.CallbackQuery):
+    session = sessionmaker(bind=engine)()
+    try:
+        user = session.query(User).filter(User.telegram_id == callback.from_user.id).first()
+        if not user:
+            await callback.answer("❌ Пользователь не найден!", show_alert=True)
+            return
+
+        # Активируем демо-подписку на 30 дней
+        if user.subscription_end and user.subscription_end > datetime.now():
+            user.subscription_end += timedelta(days=30)
+        else:
+            user.subscription_end = datetime.now() + timedelta(days=30)
+        
+        session.commit()
+
+        text = (
+            "🎉 <b>Демо-подписка активирована!</b>\n\n"
+            f"Теперь у вас есть полный доступ ко всем функциям бота на 30 дней.\n"
+            f"Окончание подписки: {user.subscription_end.strftime('%d.%m.%Y')}\n\n"
+            "🛠️ Это демо-режим для тестирования."
+        )
+        keyboard = InlineKeyboardMarkup()
+        keyboard.add(InlineKeyboardButton("🚀 Начать использовать", callback_data="main_menu"))
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+    except Exception as e:
+        logger.error(f"Demo subscription activation error: {e}")
+        await callback.answer("⚠️ Ошибка активации демо-подписки", show_alert=True)
     finally:
         session.close()
 
@@ -252,18 +291,71 @@ async def check_payment_callback(callback: types.CallbackQuery):
             await callback.answer("❌ Платеж не найден", show_alert=True)
             return
 
+        # Проверяем тип платежа
+        if payment.payment_method == 'telegram':
+            # Для платежей через ЮKassa (Telegram Payments)
+            await check_yukassa_payment(callback, payment, session)
+        else:
+            # Для платежей через Тинькофф
+            await check_tinkoff_payment(callback, payment, session)
+
+    except Exception as e:
+        logger.error(f"Payment check error: {e}")
+        await callback.answer("❌ Ошибка проверки платежа", show_alert=True)
+    finally:
+        session.close()
+
+async def check_yukassa_payment(callback: types.CallbackQuery, payment: Payment, session):
+    """Проверяет статус платежа через ЮKassa (Telegram Payments)"""
+    try:
+        # Для Telegram Payments статус уже должен быть SUCCESS
+        if payment.status == 'SUCCESS':
+            user = session.query(User).filter(User.id == payment.user_id).first()
+            if user:
+                # Обновляем подписку пользователя
+                if user.subscription_end and user.subscription_end > datetime.now():
+                    user.subscription_end += timedelta(days=30)
+                else:
+                    user.subscription_end = datetime.now() + timedelta(days=30)
+                session.commit()
+
+                text = (
+                    "🎉 <b>Подписка активирована!</b>\n\n"
+                    f"Теперь у вас есть полный доступ ко всем функциям бота.\n"
+                    f"Окончание подписки: {user.subscription_end.strftime('%d.%m.%Y')}"
+                )
+                keyboard = InlineKeyboardMarkup()
+                keyboard.add(InlineKeyboardButton("🚀 Начать использовать", callback_data="main_menu"))
+                await callback.message.edit_text(text, reply_markup=keyboard)
+            else:
+                await callback.answer("❌ Пользователь не найден", show_alert=True)
+        else:
+            await callback.answer(f"⌛ Статус платежа: {payment.status}", show_alert=True)
+    except Exception as e:
+        logger.error(f"ЮKassa payment check error: {e}")
+        await callback.answer("❌ Ошибка проверки платежа ЮKassa", show_alert=True)
+
+async def check_tinkoff_payment(callback: types.CallbackQuery, payment: Payment, session):
+    """Проверяет статус платежа через Тинькофф Кассу"""
+    try:
+        # Получаем конфигурацию Tinkoff
+        tinkoff_config = get_tinkoff_config()
+        if not tinkoff_config.terminal_key or not tinkoff_config.password:
+            await callback.answer("❌ Tinkoff API не настроен!", show_alert=True)
+            return
+
         # Проверяем статус в Tinkoff
         token_data = {
-            "TerminalKey": TINKOFF_TERMINAL_KEY,
+            "TerminalKey": tinkoff_config.terminal_key,
             "PaymentId": payment.payment_id
         }
-        token = generate_token(token_data, TINKOFF_PASSWORD)
+        token = generate_token(token_data, tinkoff_config.password)
 
         async with aiohttp.ClientSession() as http_session:
             response = await http_session.post(
                 f"{TINKOFF_API_URL}/GetState",
                 json={
-                    "TerminalKey": TINKOFF_TERMINAL_KEY,
+                    "TerminalKey": tinkoff_config.terminal_key,
                     "PaymentId": payment.payment_id,
                     "Token": token
                 },
@@ -280,7 +372,7 @@ async def check_payment_callback(callback: types.CallbackQuery):
         session.commit()
 
         if new_status == 'CONFIRMED':
-            user = session.query(User).filter(User.id == payment.account_id).first()
+            user = session.query(User).filter(User.id == payment.user_id).first()
             # Обновляем подписку пользователя
             if user.subscription_end and user.subscription_end > datetime.now():
                 user.subscription_end += timedelta(days=30)
@@ -299,98 +391,54 @@ async def check_payment_callback(callback: types.CallbackQuery):
         else:
             status_text = STATUS_DESCRIPTION.get(new_status, new_status)
             await callback.answer(f"⌛ Статус платежа: {status_text}", show_alert=True)
-
     except Exception as e:
-        logger.error(f"Payment check error: {e}")
-        await callback.answer("❌ Ошибка проверки платежа", show_alert=True)
-    finally:
-        session.close()
+        logger.error(f"Tinkoff payment check error: {e}")
+        await callback.answer("❌ Ошибка проверки платежа Тинькофф", show_alert=True)
 
-#Донаты
-class DonateStates(StatesGroup):
-    waiting_for_amount = State()
+
 
 async def donate_project_callback(callback: types.CallbackQuery):
     await callback.message.answer(
-        "Бот бесплатный, но если хотите помочь с развитием — Спасибо! ❤️",
-        parse_mode="Markdown"
+        "Бот бесплатный, но если хотите помочь с развитием — Спасибо! ❤️\n\n"
+        "+7 123 456 78 90 - Сбербанк (СБП)"
     )
-    await DonateStates.waiting_for_amount.set()
 
-async def process_donation_amount(message: types.Message, state: FSMContext):
-    session = sessionmaker(bind=engine)()
-    try:
-        amount_text = message.text.strip()
-        if not amount_text.isdigit() or int(amount_text) < 1:
-            await message.reply("❌ Пожалуйста, введите корректную сумму (целое число от 1 и выше).")
-            return
 
-        amount = int(amount_text) * 100  # копейки
-        user = session.query(User).filter(User.telegram_id == message.from_user.id).first()
-        if not user:
-            await message.reply("❌ Пользователь не найден!")
-            await state.finish()
-            return
 
-        order_id = str(random.randint(100000, 1000000000))
-        description = f"Пожертвование от {user.telegram_id}"
+# Альтернативная функция для DonatePay (быстрое решение)
+async def tinkoff_payment_menu_callback(callback: types.CallbackQuery):
+    """Показывает меню выбора тарифа для оплаты через Тинькофф"""
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    
+    keyboard.add(
+        InlineKeyboardButton("💳 1 месяц - 299₽", callback_data="tinkoff_pay_month"),
+        InlineKeyboardButton("🔙 Назад", callback_data="buy_subscription")
+    )
+    
+    await callback.message.edit_text(
+        "🏦 <b>Оплата через Тинькофф Кассу</b>\n\n"
+        "Тариф: 299₽ в месяц\n\n"
+        "Оплата производится через Тинькофф Кассу",
+        reply_markup=keyboard
+    )
 
-        token_data = {
-            "TerminalKey": TINKOFF_TERMINAL_KEY,
-            "Amount": amount,
-            "OrderId": order_id,
-            "Description": description
-        }
-        token = generate_token(token_data, TINKOFF_PASSWORD)
+async def tinkoff_pay_month_callback(callback: types.CallbackQuery):
+    """Обрабатывает оплату за месяц через Тинькофф"""
+    await callback.answer("🏦 Оплата через Тинькофф Кассу - 299₽/месяц", show_alert=True)
+    # Здесь можно добавить логику создания платежа через Тинькофф API
 
-        async with aiohttp.ClientSession() as http_session:
-            response = await http_session.post(
-                f"{TINKOFF_API_URL}/Init",
-                json={
-                    "TerminalKey": TINKOFF_TERMINAL_KEY,
-                    "Amount": amount,
-                    "OrderId": order_id,
-                    "Description": description,
-                    "Token": token
-                },
-                headers={"Content-Type": "application/json"}
-            )
-            data = await response.json()
-
-        if not data.get('Success', False):
-            error = data.get('Message', 'Неизвестная ошибка')
-            await message.reply(f"❌ Ошибка: {error}")
-            await state.finish()
-            return
-
-        payment = Payment(
-            account_id=user.id,
-            amount=amount,
-            payment_id=data['PaymentId'],
-            status=data['Status']
-        )
-        session.add(payment)
-        session.commit()
-
-        keyboard = InlineKeyboardMarkup(row_width=1)
-        keyboard.add(
-            InlineKeyboardButton("💳 Оплатить онлайн", url=data['PaymentURL']),
-            InlineKeyboardButton("🔄 Проверить оплату", callback_data=f"check_payment:{payment.id}"),
-            InlineKeyboardButton("🔙 Отмена", callback_data="main_menu")
-        )
-
-        await message.answer(
-            f"Спасибо за желание поддержать проект! Пожалуйста, оплатите сумму {int(amount/100)} руб.",
-            reply_markup=keyboard
-        )
-        await state.finish()
-
-    except Exception as e:
-        logger.error(f"Donation payment creation error: {e}")
-        await message.reply("⚠️ Ошибка при создании платежа. Попробуйте позже.")
-        await state.finish()
-    finally:
-        session.close()
+async def donate_project_donatepay_callback(callback: types.CallbackQuery):
+    """Быстрое решение с DonatePay"""
+    await callback.message.answer(
+        "💝 <b>Поддержать проект</b>\n\n"
+        "Спасибо за желание поддержать развитие бота!\n\n"
+        "🔗 <a href='https://donatepay.ru/don/ваш_логин'>Перейти к донату</a>\n\n"
+        "Или отправьте любую сумму на:\n"
+        "💳 СБП: +7XXXXXXXXXX\n"
+        "💳 Карта: 2202 XXXX XXXX XXXX",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
 
 
 def register_subscription_handlers(dp):
@@ -400,8 +448,13 @@ def register_subscription_handlers(dp):
     dp.register_callback_query_handler(activate_trial_callback, text="activate_trial", state="*")
     dp.register_callback_query_handler(buy_subscription_callback, text="buy_subscription")
     dp.register_callback_query_handler(buy_subscription_callback, text="buy_subscription", state="*")
+    dp.register_callback_query_handler(tinkoff_payment_menu_callback, text="tinkoff_payment_menu")
+    dp.register_callback_query_handler(tinkoff_payment_menu_callback, text="tinkoff_payment_menu", state="*")
+    dp.register_callback_query_handler(tinkoff_pay_month_callback, text="tinkoff_pay_month")
+    dp.register_callback_query_handler(tinkoff_pay_month_callback, text="tinkoff_pay_month", state="*")
+    dp.register_callback_query_handler(activate_demo_subscription_callback, text="activate_demo_subscription")
+    dp.register_callback_query_handler(activate_demo_subscription_callback, text="activate_demo_subscription", state="*")
     dp.register_callback_query_handler(check_payment_callback, text="check_payment")
     dp.register_callback_query_handler(check_payment_callback, text="check_payment", state="*")
     dp.register_callback_query_handler(check_payment_callback, lambda c: c.data.startswith('check_payment:'))
     dp.register_callback_query_handler(donate_project_callback, text="donate_project")
-    dp.register_message_handler(process_donation_amount, state=DonateStates.waiting_for_amount)

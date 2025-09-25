@@ -39,24 +39,41 @@ async def pnl_callback(callback: types.CallbackQuery, state: FSMContext):
     )
     await PNLStates.waiting_for_period.set()
 
-async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_date: datetime, end_date: datetime, shop_name: str):
+async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_date: datetime, end_date: datetime, shop_name: str, full_data=None):
     """Генерация Excel-отчета PNL"""
 
     session = sessionmaker()(bind=engine)
     try:
-    # Получаем свежие данные из WB API
-        loop = asyncio.get_event_loop()
-        full_data = await loop.run_in_executor(
-            None,
-            fetch_report_detail_by_period,
-            shop_api_token,
-            start_date,
-            end_date
-        )    
+        
+        # Если full_data не передан, получаем его из API
+        if full_data is None:
+            logger.info("Получаем данные из API...")
+            full_data = await fetch_full_report(shop_api_token, start_date, end_date, shop_id)
+            if not full_data:
+                logger.error("Не удалось получить данные из API")
+                return None
     
         report_data = full_data['finance']
         orders = full_data['orders']
         sales = full_data['sales']
+        
+        # Отладочная информация о входящих данных
+        logger.info(f"Входящие данные:")
+        logger.info(f"  - Finance записей: {len(report_data)}")
+        logger.info(f"  - Orders записей: {len(orders)}")
+        logger.info(f"  - Sales записей: {len(sales)}")
+        
+        if report_data:
+            sample_finance = report_data[0]
+            logger.info(f"  - Пример finance записи: {sample_finance}")
+        
+        if orders:
+            sample_order = orders[0]
+            logger.info(f"  - Пример order записи: {sample_order}")
+            
+        if sales:
+            sample_sale = sales[0]
+            logger.info(f"  - Пример sale записи: {sample_sale}")
         
         # Определяем период
         DATE_FROM = start_date.strftime("%Y-%m-%d")
@@ -65,6 +82,12 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
         df_orders = pd.DataFrame(orders)
         df_sales = pd.DataFrame(sales)
         df_fin = pd.DataFrame(report_data)
+        
+        # Отладочная информация о DataFrame
+        logger.info(f"DataFrame информация:")
+        logger.info(f"  - df_orders: {len(df_orders)} строк, колонки: {list(df_orders.columns) if not df_orders.empty else 'пустой'}")
+        logger.info(f"  - df_sales: {len(df_sales)} строк, колонки: {list(df_sales.columns) if not df_sales.empty else 'пустой'}")
+        logger.info(f"  - df_fin: {len(df_fin)} строк, колонки: {list(df_fin.columns) if not df_fin.empty else 'пустой'}")
 
         def determine_period_type(date_from, date_to):
             """Определяет тип периода и возвращает расширенный период для загрузки."""
@@ -148,12 +171,103 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
                     for_pay = ("forPay", "sum")
                 )
             )
+            
+            # Также получаем возвраты из sales данных
+            returns_mask = df_sales["saleID"].str.startswith("R", na=False)
+            if returns_mask.any():
+                df_returns_sales = df_sales[returns_mask]
+                df_returns_sales["day"] = pd.to_datetime(df_returns_sales["date"]).dt.date
+                grp_returns_sales = (
+                    df_returns_sales.groupby("day")
+                    .agg(
+                        returns_sum_sales = ("priceWithDisc", "sum"),
+                        returns_qty_sales = ("saleID", "size")
+                    )
+                )
+            else:
+                grp_returns_sales = pd.DataFrame(columns=['returns_sum_sales', 'returns_qty_sales'])
         else:
             # Создаем пустой DataFrame с нужными столбцами
             grp_sales = pd.DataFrame(columns=['sales_sum', 'sold_qty', 'for_pay'])
+            grp_returns_sales = pd.DataFrame(columns=['returns_sum_sales', 'returns_qty_sales'])
 
-        # 4.3 Finance — logistica = только delivery_rub
+        # 4.3 Finance — с правильным расчетом возвратов, удержаний и штрафов
         if not df_fin.empty:
+            # Фильтруем данные для текущего периода
+            current_start = start_date.date()
+            current_end = end_date.date()
+            
+            # Рассчитываем возвраты, удержания и штрафы из finance данных
+            returns_data = []
+            deductions_data = []
+            penalties_data = []
+            
+            for item in report_data:
+                if not isinstance(item, dict):
+                    continue
+                
+                # Проверяем дату записи
+                item_date = None
+                if "rr_dt" in item:
+                    item_date = datetime.strptime(item["rr_dt"][:10], "%Y-%m-%d").date()
+                elif "date" in item:
+                    item_date = datetime.strptime(item["date"][:10], "%Y-%m-%d").date()
+                
+                if item_date and current_start <= item_date <= current_end:
+                    doc_type = item.get("doc_type_name", "").lower()
+                    
+                    # Возвраты
+                    if "возврат" in doc_type or "return" in doc_type:
+                        returns_data.append({
+                            "day": item_date,
+                            "returns_sum": item.get("retail_price_withdisc_rub", 0) * item.get("quantity", 0),
+                            "returns_qty": item.get("quantity", 0)
+                        })
+                    
+                    # Прочие удержания (deduction)
+                    if item.get("deduction", 0) != 0:
+                        deductions_data.append({
+                            "day": item_date,
+                            "deduction": item.get("deduction", 0)
+                        })
+                    
+                    # Штрафы (penalty + другие штрафы)
+                    penalty_amount = item.get("penalty", 0)
+                    if penalty_amount != 0:
+                        penalties_data.append({
+                            "day": item_date,
+                            "penalty": penalty_amount
+                        })
+            
+            # Создаем DataFrame для возвратов, удержаний и штрафов
+            df_returns = pd.DataFrame(returns_data)
+            df_deductions = pd.DataFrame(deductions_data)
+            df_penalties = pd.DataFrame(penalties_data)
+            
+            # Группируем по дням
+            if not df_returns.empty:
+                grp_returns = df_returns.groupby("day").agg({
+                    "returns_sum": "sum",
+                    "returns_qty": "sum"
+                })
+            else:
+                grp_returns = pd.DataFrame(columns=['returns_sum', 'returns_qty'])
+            
+            if not df_deductions.empty:
+                grp_deductions = df_deductions.groupby("day").agg({
+                    "deduction": "sum"
+                }).rename(columns={"deduction": "additional_deductions"})
+            else:
+                grp_deductions = pd.DataFrame(columns=['additional_deductions'])
+            
+            if not df_penalties.empty:
+                grp_penalties = df_penalties.groupby("day").agg({
+                    "penalty": "sum"
+                }).rename(columns={"penalty": "additional_penalties"})
+            else:
+                grp_penalties = pd.DataFrame(columns=['additional_penalties'])
+            
+            # Основная группировка finance данных
             grp_fin = (
                 df_fin.groupby("day")
                     .agg(
@@ -161,13 +275,17 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
                         storage = ("storage_fee", "sum"),
                         penalty = ("penalty", "sum"),
                         acceptance = ("acceptance", "sum"),
-                        pay_for_goods = ("ppvz_for_pay", "sum")
+                        pay_for_goods = ("ppvz_for_pay", "sum"),
+                        deduction = ("deduction", "sum")  # Добавляем столбец deduction
                     )
                     .apply(pd.to_numeric, errors="coerce")
             )
         else:
-            # Создаем пустой DataFrame с нужными столбцами
-            grp_fin = pd.DataFrame(columns=['delivery_cost', 'storage', 'penalty', 'acceptance', 'pay_for_goods'])
+            # Создаем пустые DataFrame с нужными столбцами
+            grp_fin = pd.DataFrame(columns=['delivery_cost', 'storage', 'penalty', 'acceptance', 'pay_for_goods', 'deduction'])
+            grp_returns = pd.DataFrame(columns=['returns_sum', 'returns_qty'])
+            grp_deductions = pd.DataFrame(columns=['additional_deductions'])
+            grp_penalties = pd.DataFrame(columns=['additional_penalties'])
 
         # ────────────────────────────────────────────────────────────────────
         # 5. Объединяем и рассчитываем
@@ -176,9 +294,17 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
             grp_orders
             .join(grp_sales, how="outer")
             .join(grp_fin, how="outer")
+            .join(grp_returns, how="outer")
+            .join(grp_returns_sales, how="outer")
+            .join(grp_deductions, how="outer")
+            .join(grp_penalties, how="outer")
             .fillna(0)
             .infer_objects(copy=False)
         )
+        
+        # Объединяем возвраты из finance и sales
+        all_daily["returns_sum"] = all_daily["returns_sum"] + all_daily["returns_sum_sales"]
+        all_daily["returns_qty"] = all_daily["returns_qty"] + all_daily["returns_qty_sales"]
 
         all_daily["buyout_pct"] = (
             all_daily["sold_qty"] / all_daily["ordered_qty"]
@@ -200,6 +326,9 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
         logger.info(f"Записей в daily после фильтрации: {len(daily)}")
         if not daily.empty:
             logger.info(f"Индексы daily: {daily.index.tolist()}")
+        else:
+            logger.info(f"Индексы all_daily: {all_daily.index.tolist() if not all_daily.empty else 'Пустой'}")
+            logger.info(f"Проблема: нет данных в all_daily для периода {current_start} - {current_end}")
 
         # Получаем рекламу и штрафы из базы данных
         advert = sum(
@@ -212,8 +341,8 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
         stops = sum(
             i.amount for i in session.query(Penalty)
             .filter(Penalty.shop_id == shop_id)
-            .filter(Penalty.date >= start_date)
-            .filter(Penalty.date <= end_date)
+            .filter(Penalty.date >= start_date.date())
+            .filter(Penalty.date <= end_date.date())
         )
 
         # Получаем настройки налоговой системы
@@ -316,8 +445,8 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
         prev_advert = sum(
             i.amount for i in session.query(Advertisement)
             .filter(Advertisement.shop_id == shop_id)
-            .filter(Advertisement.date >= start_date - timedelta(days=period_days))
-            .filter(Advertisement.date < start_date)
+            .filter(Advertisement.date >= (start_date - timedelta(days=period_days)).date())
+            .filter(Advertisement.date < start_date.date())
             .all()
         )
 
@@ -384,21 +513,11 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
         if not report_data:
             logger.warning("Нет данных из API, но продолжаем обработку")
 
-        # Определяем путь к шаблону
-        def determine_template_path(period_type):
-            """Определяет путь к шаблону в зависимости от типа периода."""
-            if period_type == "год":
-                return "pnl_template_year.xlsx"
-            else:
-                return "pnl_template.xlsx"
-
-        template_path = determine_template_path(period_type)
-
         # Загружаем шаблон
         try:
-            wb = load_workbook(template_path)
+            wb = load_workbook("pnl_template.xlsx")
         except FileNotFoundError:
-            logger.error(f"Файл шаблона {template_path} не найден")
+            logger.error("Файл шаблона pnl_template.xlsx не найден")
             return None
 
         ws = wb.active
@@ -477,139 +596,279 @@ async def generate_pnl_excel_report(shop_id: int, shop_api_token: str, start_dat
             
             return month_cost
 
-        # Заполняем столбец C (текущие метрики)
-        row_mapping = {
-            "Заказы": 3,
-            "Выкупы": 4,
-            "Комиссия": 5,
-            "Себестоймость": 6,
-            "Налог": 7,
-            "Логистика": 8,
-            "Хранение": 9,
-            "Штрафы и корректировки": 10,
-            "Реклама": 11,
-            "К перечислению": 12,
-            "Чистая прибыль": 13
-        }
+        # Заполняем A1 - период
+        period_text = f"{start_date.strftime('%d.%m.%Y')}-{end_date.strftime('%d.%m.%Y')}"
+        ws["A1"] = period_text
 
-        for metric, value in monthly_data.items():
-            row = row_mapping.get(metric)
-            if row:
-                ws[f"C{row}"] = value
+        # Рассчитываем метрики за весь период
+        total_orders = daily["order_sum"].sum()
+        total_sales = daily["sales_sum"].sum()
+        total_cost = sum(calculate_cost_for_day(date, report_data) for date in daily.index)
+        # Правильный расчет комиссии WB
+        # Комиссия = ppvz_sales_commission + ppvz_vw + ppvz_vw_nds
+        total_commission = sum(
+            item.get("ppvz_sales_commission", 0) +
+            item.get("ppvz_vw", 0) +
+            item.get("ppvz_vw_nds", 0)
+            for item in report_data
+        )
+        # Правильный расчет возвратов
+        total_returns = daily["returns_sum"].sum()
+        
+        # Также добавляем возвраты из sales данных за текущий период
+        current_sales_returns = [sale for sale in sales if 
+                               sale.get("saleID", "").startswith("R") and
+                               start_date <= datetime.strptime(sale.get("date", "2025-01-01")[:10], "%Y-%m-%d") <= end_date]
+        for sale in current_sales_returns:
+            total_returns += sale.get("priceWithDisc", 0)
+        total_advert = sum(
+            i.amount for i in session.query(Advertisement)
+            .filter(Advertisement.shop_id == shop_id)
+            .filter(Advertisement.date >= start_date.date())
+            .filter(Advertisement.date <= end_date.date())
+            .all()
+        )
+        total_logistics = daily["delivery_cost"].sum()
+        total_storage = daily["storage"].sum()
+        # Правильный расчет прочих удержаний
+        total_deductions = daily["deduction"].sum() + daily["additional_deductions"].sum()
+        # Правильный расчет штрафов (включая штрафы из БД)
+        total_penalties = daily["penalty"].sum() + daily["additional_penalties"].sum() + stops
+        total_payout = total_sales - total_commission - total_logistics - total_storage - total_penalties - total_advert - total_cost
+        total_tax = total_sales * tax_rate
+        total_profit = total_sales - total_commission - total_logistics - total_storage - total_penalties - total_tax - total_advert - total_cost
 
-        # Заполняем столбец E (относительные изменения)
-        for metric, change in relative_changes.items():
-            row = row_mapping.get(metric)
-            if row:
-                ws[f"E{row}"] = change
+        # Заполняем строку 2 (метрики за весь период)
+        ws["B2"] = total_orders
+        ws["C2"] = total_sales
+        ws["D2"] = total_cost
+        ws["E2"] = total_commission
+        ws["F2"] = total_returns
+        ws["G2"] = total_advert
+        ws["H2"] = total_logistics
+        ws["I2"] = total_storage
+        ws["J2"] = total_deductions
+        ws["K2"] = total_penalties
+        ws["L2"] = total_payout
+        ws["M2"] = total_tax
+        ws["N2"] = total_profit
 
-        # Заполняем столбцы F-AJ в зависимости от типа периода
-        if period_type == "день":
-            # Для дня - не заполняем столбцы F-AJ
-            pass
-        elif period_type == "неделя":
-            # Для недели - заполняем F-L по дням недели
-            weekdays = ['F', 'G', 'H', 'I', 'J', 'K', 'L']
-            for i, col in enumerate(weekdays):
-                if i < len(daily):
-                    day_data = daily.iloc[i] if i < len(daily) else pd.Series(0, index=daily.columns)
-                    day_date = start_date + timedelta(days=i)
-                    day_cost = calculate_cost_for_day(day_date, report_data)
-                    
-                    ws[f"{col}3"] = day_data.get("order_sum", 0)  # Заказы
-                    ws[f"{col}4"] = day_data.get("sales_sum", 0)  # Выкупы
-                    ws[f"{col}5"] = day_data.get("pay_for_goods", 0)  # Комиссия
-                    ws[f"{col}6"] = day_cost  # Себестоймость
-                    ws[f"{col}7"] = day_data.get("sales_sum", 0) * tax_rate  # Налог
-                    ws[f"{col}8"] = day_data.get("delivery_cost", 0)  # Логистика
-                    ws[f"{col}9"] = day_data.get("storage", 0)  # Хранение
-                    ws[f"{col}10"] = day_data.get("penalty", 0)  # Штрафы и корректировки
-                    # Получаем рекламу для конкретного дня
-                    day_advert = sum(
-                        i.amount for i in session.query(Advertisement)
-                        .filter(Advertisement.shop_id == shop_id)
-                        .filter(Advertisement.date == day_date)
-                        .all()
-                    )
-                    ws[f"{col}11"] = day_advert  # Реклама
-                    ws[f"{col}12"] = day_data.get("sales_sum", 0) - day_data.get("pay_for_goods", 0) - day_data.get("delivery_cost", 0) - day_data.get("storage", 0) - day_data.get("penalty", 0) - day_advert - day_cost  # К перечислению
-                    ws[f"{col}13"] = day_data.get("sales_sum", 0) - day_data.get("pay_for_goods", 0) - day_data.get("delivery_cost", 0) - day_data.get("storage", 0) - day_data.get("penalty", 0) - (day_data.get("sales_sum", 0) * tax_rate) - day_advert - day_cost  # Чистая прибыль
-        elif period_type == "месяц":
-            # Для месяца - заполняем F-AJ по дням месяца
-            columns = ['F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
-                       'AA', 'AB', 'AC', 'AD', 'AE', 'AF', 'AG', 'AH', 'AI', 'AJ']
+        # Рассчитываем разницу с прошлым периодом
+        # Данные за прошлый период уже включены в full_data благодаря расширению периода в wb_api.py
+        period_days = (end_date - start_date).days + 1
+        prev_start_date = start_date - timedelta(days=period_days)
+        prev_end_date = start_date - timedelta(days=1)
+        
+        # Фильтруем данные за прошлый период из уже полученных данных
+        def parse_date_safe(date_str, default='2025-01-01'):
+            """Безопасный парсинг даты с обработкой различных форматов"""
+            if not date_str:
+                return datetime.strptime(default, '%Y-%m-%d')
+            try:
+                # Убираем время если есть (T21:48:39)
+                date_only = date_str.split('T')[0] if 'T' in date_str else date_str
+                return datetime.strptime(date_only, '%Y-%m-%d')
+            except ValueError:
+                return datetime.strptime(default, '%Y-%m-%d')
+        
+        prev_report_data = [item for item in report_data if 
+                           prev_start_date <= parse_date_safe(item.get('rr_dt', item.get('date'))) <= prev_end_date]
+        prev_orders = [order for order in orders if 
+                      prev_start_date <= parse_date_safe(order.get('date')) <= prev_end_date]
+        prev_sales = [sale for sale in sales if 
+                     prev_start_date <= parse_date_safe(sale.get('date')) <= prev_end_date]
+        
+        # Обрабатываем данные за прошлый период
+        prev_df_orders = pd.DataFrame(prev_orders)
+        prev_df_sales = pd.DataFrame(prev_sales)
+        prev_df_fin = pd.DataFrame(prev_report_data)
+        
+        # Рассчитываем метрики за прошлый период
+        prev_total_orders = prev_df_orders["priceWithDisc"].sum() if not prev_df_orders.empty else 0
+        prev_total_sales = prev_df_sales["priceWithDisc"].sum() if not prev_df_sales.empty else 0
+        prev_total_cost = sum(calculate_cost_for_day(date, prev_report_data) for date in pd.date_range(prev_start_date, prev_end_date))
+        # Правильный расчет комиссии WB для прошлого периода
+        prev_total_commission = sum(
+            item.get("ppvz_sales_commission", 0) +
+            item.get("ppvz_vw", 0) +
+            item.get("ppvz_vw_nds", 0)
+            for item in prev_report_data
+        )
+        # Правильный расчет возвратов для прошлого периода
+        prev_total_returns = 0
+        for item in prev_report_data:
+            if not isinstance(item, dict):
+                continue
+            doc_type = item.get("doc_type_name", "").lower()
+            if "возврат" in doc_type or "return" in doc_type:
+                prev_total_returns += item.get("retail_price_withdisc_rub", 0) * item.get("quantity", 0)
+        
+        # Также добавляем возвраты из sales данных за предыдущий период
+        prev_sales_returns = [sale for sale in prev_sales if sale.get("saleID", "").startswith("R")]
+        for sale in prev_sales_returns:
+            prev_total_returns += sale.get("priceWithDisc", 0)
+        
+        prev_total_advert = sum(
+            i.amount for i in session.query(Advertisement)
+            .filter(Advertisement.shop_id == shop_id)
+            .filter(Advertisement.date >= prev_start_date)
+            .filter(Advertisement.date <= prev_end_date)
+            .all()
+        )
+        prev_total_logistics = prev_df_fin["delivery_rub"].sum() if not prev_df_fin.empty else 0
+        prev_total_storage = prev_df_fin["storage_fee"].sum() if not prev_df_fin.empty else 0
+        # Правильный расчет штрафов для прошлого периода
+        prev_total_penalties = prev_df_fin["penalty"].sum() if not prev_df_fin.empty else 0
+        # Правильный расчет прочих удержаний для прошлого периода
+        prev_total_deductions = sum(item.get("deduction", 0) for item in prev_report_data)
+        
+        prev_total_tax = prev_total_sales * tax_rate
+        prev_total_profit = prev_total_sales - prev_total_commission - prev_total_logistics - prev_total_storage - prev_total_penalties - prev_total_tax - prev_total_advert - prev_total_cost
+
+        # Заполняем строку 3 (разница с прошлым периодом) - сохраняем исходное форматирование
+        values = [
+            ("B4", total_orders - prev_total_orders),
+            ("C4", total_sales - prev_total_sales),
+            ("D4", total_cost - prev_total_cost),
+            ("E4", total_commission - prev_total_commission),
+            ("F4", total_returns - prev_total_returns),
+            ("G4", total_advert - prev_total_advert),
+            ("H4", total_logistics - prev_total_logistics),
+            ("I4", total_storage - prev_total_storage),
+            ("J4", total_deductions - prev_total_deductions),
+            ("K4", total_penalties - prev_total_penalties),
+            ("L4", total_payout - (prev_total_sales - prev_total_commission - prev_total_logistics - prev_total_storage - prev_total_penalties - prev_total_advert - prev_total_cost)),
+            ("M4", total_tax - prev_total_tax),
+            ("N4", total_profit - prev_total_profit)
+        ]
+        
+        for cell_ref, value in values:
+            cell = ws[cell_ref]
+            original_format = cell.number_format  # Сохраняем исходное форматирование
+            cell.value = value
+            cell.number_format = original_format  # Восстанавливаем исходное форматирование
+
+        # Создаем полный диапазон дат для заполнения всех дней периода
+        date_range = pd.date_range(start=current_start, end=current_end, freq='D')
+        
+        # Логируем информацию о диапазоне дат
+        logger.info(f"Создан диапазон дат: {len(date_range)} дней с {current_start} по {current_end}")
+        logger.info(f"Дни в диапазоне: {[d.strftime('%Y-%m-%d') for d in date_range]}")
+        
+        # Заполняем данные по дням начиная с 5 строки
+        row = 5
+        for date in date_range:
+            # Конвертируем pandas.Timestamp в datetime.date для сравнения
+            date_date = date.date()
             
-            for day_num in range(1, 32):
-                if day_num <= len(columns):
-                    col_letter = columns[day_num - 1]
-                    day_date = current_start.replace(day=day_num)
-                    if day_date in daily.index:
-                        day_data = daily.loc[day_date]
-                    else:
-                        day_data = pd.Series(0, index=daily.columns)
-                    
-                    day_cost = calculate_cost_for_day(day_date, report_data)
-                    
-                    ws[f"{col_letter}3"] = day_data.get("order_sum", 0)  # Заказы
-                    ws[f"{col_letter}4"] = day_data.get("sales_sum", 0)  # Выкупы
-                    ws[f"{col_letter}5"] = day_data.get("pay_for_goods", 0)  # Комиссия
-                    ws[f"{col_letter}6"] = day_cost  # Себестоймость
-                    ws[f"{col_letter}7"] = day_data.get("sales_sum", 0) * tax_rate  # Налог
-                    ws[f"{col_letter}8"] = day_data.get("delivery_cost", 0)  # Логистика
-                    ws[f"{col_letter}9"] = day_data.get("storage", 0)  # Хранение
-                    ws[f"{col_letter}10"] = day_data.get("penalty", 0)  # Штрафы и корректировки
-                    # Получаем рекламу для конкретного дня месяца
-                    day_advert = sum(
-                        i.amount for i in session.query(Advertisement)
-                        .filter(Advertisement.shop_id == shop_id)
-                        .filter(Advertisement.date == day_date)
-                        .all()
-                    )
-                    ws[f"{col_letter}11"] = day_advert  # Реклама
-                    ws[f"{col_letter}12"] = day_data.get("sales_sum", 0) - day_data.get("pay_for_goods", 0) - day_data.get("delivery_cost", 0) - day_data.get("storage", 0) - day_data.get("penalty", 0) - day_advert - day_cost  # К перечислению
-                    ws[f"{col_letter}13"] = day_data.get("sales_sum", 0) - day_data.get("pay_for_goods", 0) - day_data.get("delivery_cost", 0) - day_data.get("storage", 0) - day_data.get("penalty", 0) - (day_data.get("sales_sum", 0) * tax_rate) - day_advert - day_cost  # Чистая прибыль
-        elif period_type == "год":
-            # Для года - заполняем F-Q по месяцам
-            months = ['F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q']
+            # Получаем данные за день (если есть)
+            if date_date in daily.index:
+                day_data = daily.loc[date_date]
+                logger.info(f"День {date.strftime('%Y-%m-%d')}: найдены данные")
+            else:
+                # Если данных нет, создаем пустые значения
+                day_data = pd.Series({
+                    'order_sum': 0,
+                    'sales_sum': 0,
+                    'delivery_cost': 0,
+                    'storage': 0,
+                    'penalty': 0,
+                    'returns_sum': 0,
+                    'deduction': 0,
+                    'additional_penalties': 0,
+                    'additional_deductions': 0
+                })
+                logger.info(f"День {date.strftime('%Y-%m-%d')}: данных нет, заполняем нулями")
             
-            # Группируем данные по месяцам
-            daily_copy = daily.copy()
-            daily_copy.index = pd.to_datetime(daily_copy.index)
+            day_cost = calculate_cost_for_day(date_date, report_data)
             
-            # Определяем текущий месяц
-            current_month = dt.now().month
-            current_year = dt.now().year
+            # Получаем рекламу за день
+            day_advert = sum(
+                i.amount for i in session.query(Advertisement)
+                .filter(Advertisement.shop_id == shop_id)
+                .filter(Advertisement.date == date_date)
+                .all()
+            )
             
-            for month_num in range(1, 13):
-                if month_num <= current_month:  # Заполняем только до текущего месяца
-                    col_letter = months[month_num - 1]
-                    month_data = daily_copy[daily_copy.index.month == month_num]
+            # Рассчитываем метрики за день
+            day_orders = day_data.get("order_sum", 0)
+            day_sales = day_data.get("sales_sum", 0)
+            
+            # Правильный расчет комиссии WB для дня
+            day_report_data = [item for item in report_data if 
+                              parse_date_safe(item.get('rr_dt', item.get('date'))).date() == date_date]
+            day_commission = sum(
+                item.get("ppvz_sales_commission", 0) +
+                item.get("ppvz_vw", 0) +
+                item.get("ppvz_vw_nds", 0)
+                for item in day_report_data
+            )
+            
+            day_logistics = day_data.get("delivery_cost", 0)
+            day_storage = day_data.get("storage", 0)
+            day_penalties = day_data.get("penalty", 0)
+            day_returns = day_data.get("returns_sum", 0)
+            
+            # Также добавляем возвраты из sales данных за этот день
+            day_sales_returns = [sale for sale in sales if 
+                               sale.get("saleID", "").startswith("R") and
+                               datetime.strptime(sale.get("date", "2025-01-01")[:10], "%Y-%m-%d").date() == date_date]
+            for sale in day_sales_returns:
+                day_returns += sale.get("priceWithDisc", 0)
+            day_deductions = day_data.get("deduction", 0)
+            
+            # Объединяем штрафы из основного finance и дополнительных штрафов
+            additional_penalties = day_data.get("additional_penalties", 0)
+            additional_deductions = day_data.get("additional_deductions", 0)
+            total_day_penalties = day_penalties + additional_penalties
+            total_day_deductions = day_deductions + additional_deductions
+            day_tax = day_sales * tax_rate
+            day_profit = day_sales - day_commission - day_logistics - day_storage - total_day_penalties - day_tax - day_advert - day_cost
+            
+            # Заполняем строку
+            ws[f"A{row}"] = date.strftime("%d.%m.%Y")  # Дата в формате ДД.ММ.ГГГГ
+            ws[f"B{row}"] = day_orders
+            ws[f"C{row}"] = day_sales
+            ws[f"D{row}"] = day_cost
+            ws[f"E{row}"] = day_commission
+            ws[f"F{row}"] = day_returns
+            ws[f"G{row}"] = day_advert
+            ws[f"H{row}"] = day_logistics
+            ws[f"I{row}"] = day_storage
+            ws[f"J{row}"] = total_day_deductions
+            ws[f"K{row}"] = total_day_penalties
+            ws[f"L{row}"] = day_sales - day_commission - day_logistics - day_storage - total_day_penalties - day_advert - day_cost
+            ws[f"M{row}"] = day_tax
+            ws[f"N{row}"] = day_profit
+            
+            # Копируем стиль с 5-й строки (шаблон) для всех ячеек
+            if row > 5:
+                # Копируем форматирование ячеек
+                for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N']:
+                    source_cell = ws[f"{col}5"]
+                    target_cell = ws[f"{col}{row}"]
                     
-                    if not month_data.empty:
-                        month_sum = month_data.sum()
-                        month_cost = calculate_cost_for_month(month_num, current_year, report_data)
-                        
-                        ws[f"{col_letter}3"] = month_sum.get("order_sum", 0)  # Заказы
-                        ws[f"{col_letter}4"] = month_sum.get("sales_sum", 0)  # Выкупы
-                        ws[f"{col_letter}5"] = month_sum.get("pay_for_goods", 0)  # Комиссия
-                        ws[f"{col_letter}6"] = month_cost  # Себестоймость
-                        ws[f"{col_letter}7"] = month_sum.get("sales_sum", 0) * tax_rate  # Налог
-                        ws[f"{col_letter}8"] = month_sum.get("delivery_cost", 0)  # Логистика
-                        ws[f"{col_letter}9"] = month_sum.get("storage", 0)  # Хранение
-                        ws[f"{col_letter}10"] = month_sum.get("penalty", 0)  # Штрафы и корректировки
-                        # Получаем рекламу для конкретного месяца
-                        month_start = datetime(current_year, month_num, 1)
-                        month_end = datetime(current_year, month_num, 1) + relativedelta(months=1) - timedelta(days=1)
-                        month_advert = sum(
-                            i.amount for i in session.query(Advertisement)
-                            .filter(Advertisement.shop_id == shop_id)
-                            .filter(Advertisement.date >= month_start)
-                            .filter(Advertisement.date <= month_end)
-                            .all()
-                        )
-                        ws[f"{col_letter}11"] = month_advert  # Реклама
-                        ws[f"{col_letter}12"] = month_sum.get("sales_sum", 0) - month_sum.get("pay_for_goods", 0) - month_sum.get("delivery_cost", 0) - month_sum.get("storage", 0) - month_sum.get("penalty", 0) - month_advert - month_cost  # К перечислению
-                        ws[f"{col_letter}13"] = month_sum.get("sales_sum", 0) - month_sum.get("pay_for_goods", 0) - month_sum.get("delivery_cost", 0) - month_sum.get("storage", 0) - month_sum.get("penalty", 0) - (month_sum.get("sales_sum", 0) * tax_rate) - month_advert - month_cost  # Чистая прибыль
+                    # Копируем форматирование безопасно
+                    try:
+                        if source_cell.font:
+                            target_cell.font = source_cell.font.copy()
+                        if source_cell.border:
+                            target_cell.border = source_cell.border.copy()
+                        if source_cell.fill:
+                            target_cell.fill = source_cell.fill.copy()
+                        if source_cell.number_format:
+                            target_cell.number_format = source_cell.number_format
+                        if source_cell.alignment:
+                            target_cell.alignment = source_cell.alignment.copy()
+                    except Exception as style_error:
+                        # Если не удается скопировать стиль, используем базовое форматирование
+                        logger.warning(f"Не удалось скопировать стиль для ячейки {col}{row}: {style_error}")
+                        # Устанавливаем базовое форматирование
+                        target_cell.number_format = '#,##0.00'
+            
+            row += 1
+
+        logger.info(f"Заполнено строк: {row - 5} (с 5-й по {row-1}-ю строку)")
 
         return wb
         
@@ -678,13 +937,12 @@ async def select_pnl_period_callback(callback: types.CallbackQuery, state: FSMCo
     
     # Формируем имя файла
     safe_shop_name = "".join(c for c in shop_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
-    filename = f"pnl_{safe_shop_name}_{datetime.now().strftime('%Y%m%d%H%M')}.xlsx"
+    filename = f"PNL.xlsx"
     
     # Отправляем файл
     file = InputFile(file_stream, filename=filename)
     await callback.message.answer_document(
         file,
-        caption=f"📊 PNL отчет за {period_name}\nМагазин: {shop_name}"
     )
     
     # Возвращаемся к меню PNL

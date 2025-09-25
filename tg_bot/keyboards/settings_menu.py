@@ -1,15 +1,18 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from tg_bot.models import TaxSystemType, RegularExpenseFrequency
 
-def settings_menu_keyboard(id_shop):
+def settings_menu_keyboard(id_shop, daily_reports_enabled=False):
     keyboard = InlineKeyboardMarkup(row_width=1)
     keyboard.add(
         InlineKeyboardButton("🔑 Изменить API ключ", callback_data=f"change_api_{id_shop}"),
-        InlineKeyboardButton("Налоговая система", callback_data="tax_settings"),
+        InlineKeyboardButton("Налоговая система", callback_data="tax_custom"),
         InlineKeyboardButton("Себестоимость артикулов", callback_data="product_cost"),
-        InlineKeyboardButton("Инвестиционные затраты", callback_data="one_time_expenses"),
-        InlineKeyboardButton("Регулярные затраты", callback_data="regular_expenses"),
-        InlineKeyboardButton("Автоматические отчёты", callback_data="daily_reports"),
+        #InlineKeyboardButton("Инвестиционные затраты", callback_data="one_time_expenses"),
+        #InlineKeyboardButton("Регулярные затраты", callback_data="regular_expenses"),
+        # InlineKeyboardButton(
+        #     f"{'✅' if daily_reports_enabled else '❌'} Автоматические отчёты", 
+        #     callback_data="daily_reports"
+        # ),
         InlineKeyboardButton("Назад", callback_data="main_menu")
     )
     return keyboard

@@ -32,7 +32,7 @@ async def daily_reports_callback(callback: types.CallbackQuery, state):
         user = session.query(User).filter(User.telegram_id == callback.from_user.id).first()
         if user:
             # Переключаем состояние ежедневных отчетов
-            user.daily_reports_enabled = not getattr(user, "daily_reports_enabled", False)
+            user.daily_reports_enabled = not user.daily_reports_enabled
             session.commit()
             status = "включены" if user.daily_reports_enabled else "выключены"
             await callback.answer(f"Ежедневные отчёты {status}!", show_alert=True)
@@ -50,6 +50,14 @@ async def daily_reports_callback(callback: types.CallbackQuery, state):
                     "❌ Автоматические отчеты отключены.\n"
                     "Вы больше не будете получать еженедельные и ежемесячные отчеты."
                 )
+            
+            # Обновляем меню настроек с новым статусом
+            try:
+                await callback.message.edit_reply_markup(
+                    reply_markup=settings_menu_keyboard(user.shops[0].id, user.daily_reports_enabled)
+                )
+            except:
+                pass  # Игнорируем ошибки при обновлении клавиатуры
         else:
             await callback.answer("Пользователь не найден", show_alert=True)
     except Exception as e:
@@ -75,13 +83,13 @@ async def settings_callback(callback: types.CallbackQuery, state: FSMContext):
     try:
         await callback.message.edit_text(
             "⚙️ <b>Настройка параметров</b>\nВыберите опцию:",
-            reply_markup=settings_menu_keyboard(shop.id)
+            reply_markup=settings_menu_keyboard(shop.id, user.daily_reports_enabled)
         )
     except:
         await callback.message.delete()
         await callback.message.answer(
             "⚙️ <b>Настройка параметров</b>\nВыберите опцию:",
-            reply_markup=settings_menu_keyboard(shop.id)
+            reply_markup=settings_menu_keyboard(shop.id, user.daily_reports_enabled)
         )
 
 async def back_to_settings(callback: types.CallbackQuery, state: FSMContext):
@@ -96,7 +104,7 @@ async def back_to_settings(callback: types.CallbackQuery, state: FSMContext):
     session.close()
     await callback.message.edit_text(
         "⚙️ <b>Настройка параметров</b>\nВыберите опцию:",
-        reply_markup=settings_menu_keyboard(shop.id)
+        reply_markup=settings_menu_keyboard(shop.id, user.daily_reports_enabled)
     )
 async def back_to_settings_message(message: types.Message, state: FSMContext):
     await SettingsStates.menu.set()
@@ -107,7 +115,7 @@ async def back_to_settings_message(message: types.Message, state: FSMContext):
     session.close()
     await message.answer(
         "⚙️ <b>Настройка параметров</b>\nВыберите опцию:",
-        reply_markup=settings_menu_keyboard(shop.id)
+        reply_markup=settings_menu_keyboard(shop.id, user.daily_reports_enabled)
     )
 
 async def product_cost_callback_helper(message: types.Message):
@@ -125,13 +133,16 @@ async def product_cost_callback_helper(message: types.Message):
 
 # Налоговая система
 async def tax_settings_callback(callback: types.CallbackQuery, state: FSMContext):
+    print(f"tax_settings_callback called with data: {callback.data}")
     session = sessionmaker()(bind=engine)
     try:
         async with state.proxy() as data:
+            print(f"State data: {data}")
             if 'shop' not in data:
                 await callback.answer("❌ Сначала выберите магазин", show_alert=True)
                 return
             shop_id = data['shop']['id']
+            print(f"Shop ID: {shop_id}")
         
         shop = session.query(Shop).filter(Shop.id == shop_id).first()
         if not shop:
@@ -139,6 +150,7 @@ async def tax_settings_callback(callback: types.CallbackQuery, state: FSMContext
             return
         
         current_tax = shop.tax_settings.tax_system if shop.tax_settings else None
+        print(f"Current tax: {current_tax}")
         
         text = "<b>Налоговая система</b>\n\n"
         if current_tax:
@@ -148,8 +160,22 @@ async def tax_settings_callback(callback: types.CallbackQuery, state: FSMContext
         
         text += "Выберите систему налогообложения:"
         
-        await callback.message.edit_text(text, reply_markup=tax_system_keyboard(current_tax))
+        try:
+            await callback.message.edit_text(text, reply_markup=tax_system_keyboard(current_tax))
+        except Exception as edit_error:
+            print(f"Edit error: {edit_error}")
+            # Если не удалось отредактировать, отправляем новое сообщение
+            try:
+                await callback.message.delete()
+            except:
+                pass  # Игнорируем ошибку удаления
+            await callback.message.answer(text, reply_markup=tax_system_keyboard(current_tax))
+            return  # Выходим из функции, чтобы избежать повторного вызова
+        
         await SettingsStates.tax_system.set()
+    except Exception as e:
+        print(f"Error in tax_settings_callback: {e}")
+        await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
     finally:
         session.close()
 
@@ -216,7 +242,6 @@ async def set_tax_system_callback(callback: types.CallbackQuery, state: FSMConte
     elif tax_type_value == "custom":
         # Переходим к вводу процента
         await set_custom_tax_callback(callback, state)
-        print("custom_percent = ", custom_percent)
         return        
     else:
         await callback.answer("❌ Неизвестный тип налоговой системы")
@@ -768,12 +793,12 @@ def register_settings_handlers(dp):
     # Тест планировщика отчетов
     dp.register_callback_query_handler(test_reports_callback, text="test_reports", state="*")
     # Налоговая система
-
-    # Обработчик для ввода процента налога
+    
+    # Обработчик для кнопки "Налоговая система" - сразу переход к вводу процента
     dp.register_callback_query_handler(
         set_custom_tax_callback, 
         lambda c: c.data == "tax_custom", 
-        state=SettingsStates.tax_system
+        state="*"
     )
     
     # Обработчик ввода процента с клавиатуры

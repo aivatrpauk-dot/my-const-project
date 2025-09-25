@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 from tg_bot.models import sessionmaker, engine, User
 import logging
 import asyncio
+import os
+from pathlib import Path
 
 
 #ADMIN_IDS = [1924535035, 1441962095, 1275991975, 1275991975]
@@ -23,6 +25,8 @@ async def admin_command(message: types.Message):
     keyboard.add(
         InlineKeyboardButton("📊 Аналитика", callback_data="admin_analytics"),
         InlineKeyboardButton("📢 Сделать рассылку", callback_data="admin_broadcast"),
+        InlineKeyboardButton("🗑️ Очистить кэш", callback_data="admin_clear_cache"),
+        InlineKeyboardButton("📈 Статистика кэша", callback_data="admin_cache_stats"),
         InlineKeyboardButton("🔙 Выход", callback_data="main_menu")
     )
     
@@ -249,6 +253,8 @@ async def admin_panel_callback(callback: types.CallbackQuery):
     keyboard.add(
         InlineKeyboardButton("📊 Аналитика", callback_data="admin_analytics"),
         InlineKeyboardButton("📢 Сделать рассылку", callback_data="admin_broadcast"),
+        InlineKeyboardButton("🗑️ Очистить кэш", callback_data="admin_clear_cache"),
+        InlineKeyboardButton("📈 Статистика кэша", callback_data="admin_cache_stats"),
         InlineKeyboardButton("🔙 Выход", callback_data="main_menu")
     )
     
@@ -262,13 +268,133 @@ async def get_total_users():
     finally:
         session.close()
 
+async def clear_cache_command(message: types.Message):
+    """Очистка кэша данных"""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔️ У вас нет прав доступа к этой команде")
+        return
+    
+    try:
+        # Импортируем функции очистки кэша из wb_api
+        from tg_bot.services.wb_api import clear_all_cache
+        
+        # Очищаем весь кэш в базе данных
+        clear_all_cache()
+        
+        # Также удаляем старый файл кэша если он существует
+        cache_file = Path("wb_cache_data.json")
+        if cache_file.exists():
+            cache_file.unlink()
+            await message.answer("✅ Кэш успешно очищен!\n\n- Удален файл кэша\n- Очищена база данных кэша\n\nСледующий запрос будет загружать данные напрямую с API Wildberries.")
+        else:
+            await message.answer("✅ Кэш успешно очищен!\n\n- Очищена база данных кэша\n\nСледующий запрос будет загружать данные напрямую с API Wildberries.")
+            
+    except Exception as e:
+        logger.error(f"Ошибка очистки кэша: {e}")
+        await message.answer(f"❌ Ошибка при очистке кэша: {str(e)}")
+
+async def admin_clear_cache_callback(callback: types.CallbackQuery):
+    """Обработчик кнопки очистки кэша в админ-панели"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔️ Доступ запрещен", show_alert=True)
+        return
+    
+    try:
+        # Импортируем функции очистки кэша из wb_api
+        from tg_bot.services.wb_api import clear_all_cache
+        
+        # Очищаем весь кэш в базе данных
+        clear_all_cache()
+        
+        # Также удаляем старый файл кэша если он существует
+        cache_file = Path("wb_cache_data.json")
+        if cache_file.exists():
+            cache_file.unlink()
+            await callback.answer("✅ Кэш успешно очищен!\n\n- Удален файл кэша\n- Очищена база данных кэша", show_alert=True)
+        else:
+            await callback.answer("✅ Кэш успешно очищен!\n\n- Очищена база данных кэша", show_alert=True)
+            
+    except Exception as e:
+        logger.error(f"Ошибка очистки кэша: {e}")
+        await callback.answer(f"❌ Ошибка при очистке кэша: {str(e)}", show_alert=True)
+
+async def admin_cache_stats_callback(callback: types.CallbackQuery):
+    """Показывает статистику кэша"""
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔️ Доступ запрещен", show_alert=True)
+        return
+    
+    try:
+        from tg_bot.models import WBCacheData
+        
+        session = sessionmaker(bind=engine)()
+        
+        # Получаем статистику кэша
+        total_cache_records = session.query(WBCacheData).count()
+        
+        # Статистика по типам данных
+        orders_cache = session.query(WBCacheData).filter(WBCacheData.cache_type == "orders").count()
+        sales_cache = session.query(WBCacheData).filter(WBCacheData.cache_type == "sales").count()
+        finance_cache = session.query(WBCacheData).filter(WBCacheData.cache_type == "finance").count()
+        
+        # Статистика по магазинам
+        unique_shops = session.query(WBCacheData.shop_id).distinct().count()
+        
+        # Самый старый и новый кэш
+        oldest_cache = session.query(WBCacheData).order_by(WBCacheData.cache_timestamp.asc()).first()
+        newest_cache = session.query(WBCacheData).order_by(WBCacheData.cache_timestamp.desc()).first()
+        
+        # Размер кэша (примерно)
+        cache_size_mb = total_cache_records * 0.1  # Примерно 100KB на запись
+        
+        stats_text = (
+            "📊 <b>Статистика кэша WB API</b>\n\n"
+            f"📈 <b>Общая статистика:</b>\n"
+            f"• Всего записей: {total_cache_records}\n"
+            f"• Уникальных магазинов: {unique_shops}\n"
+            f"• Примерный размер: {cache_size_mb:.1f} MB\n\n"
+            f"📋 <b>По типам данных:</b>\n"
+            f"• Orders: {orders_cache}\n"
+            f"• Sales: {sales_cache}\n"
+            f"• Finance: {finance_cache}\n\n"
+        )
+        
+        if oldest_cache and newest_cache:
+            oldest_time = oldest_cache.cache_timestamp.strftime("%Y-%m-%d %H:%M")
+            newest_time = newest_cache.cache_timestamp.strftime("%Y-%m-%d %H:%M")
+            stats_text += (
+                f"⏰ <b>Временные рамки:</b>\n"
+                f"• Самый старый кэш: {oldest_time}\n"
+                f"• Самый новый кэш: {newest_time}\n"
+            )
+        
+        # Создаем клавиатуру с кнопкой очистки
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        keyboard.add(
+            InlineKeyboardButton("🗑️ Очистить кэш", callback_data="admin_clear_cache"),
+            InlineKeyboardButton("🔙 Назад", callback_data="admin_panel")
+        )
+        
+        await callback.message.edit_text(stats_text, reply_markup=keyboard)
+        
+    except Exception as e:
+        logger.error(f"Ошибка получения статистики кэша: {e}")
+        await callback.answer(f"❌ Ошибка при получении статистики: {str(e)}", show_alert=True)
+    finally:
+        session.close()
+
 def register_admin_handlers(dp):
     dp.register_message_handler(admin_command, commands=['admin'])
     dp.register_message_handler(admin_command, commands=['admin'], state="*")
+    dp.register_message_handler(clear_cache_command, commands=['clearcache'])
+    dp.register_message_handler(clear_cache_command, commands=['clearcache'], state="*")
     dp.register_callback_query_handler(admin_panel_callback, text="admin_panel")
     dp.register_callback_query_handler(admin_panel_callback, text="admin_panel", state="*")
     dp.register_callback_query_handler(admin_analytics_callback, text="admin_analytics")
     dp.register_callback_query_handler(admin_analytics_callback, text="admin_analytics", state="*")
     dp.register_callback_query_handler(admin_broadcast_callback, text="admin_broadcast", state="*")
+    dp.register_callback_query_handler(admin_clear_cache_callback, text="admin_clear_cache")
+    dp.register_callback_query_handler(admin_clear_cache_callback, text="admin_clear_cache", state="*")
+    dp.register_callback_query_handler(admin_cache_stats_callback, text="admin_cache_stats")
     dp.register_message_handler(process_broadcast_message, content_types=types.ContentTypes.ANY, state="admin_broadcast")
     dp.register_callback_query_handler(confirm_broadcast_callback, text="confirm_broadcast", state="*")

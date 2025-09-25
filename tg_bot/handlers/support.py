@@ -16,10 +16,13 @@ async def support_main(call: types.CallbackQuery):
 async def support_command(message: types.Message):
     text = "Если у вас возникли вопросы, обратитесь в поддержку:\nhttps://t.me/Denissssw"
     await message.answer(text)
+    print(f"Команда /support вызвана пользователем {message.from_user.id}")
 
 
 def register_support_handlers(dp: Dispatcher):
+    print("Регистрирую обработчики поддержки...")
     # Регистрируем обработчик для callback "support"
     dp.register_callback_query_handler(support_main, text="support", state="*")
     # Регистрируем обработчик для команды /support
-    dp.register_message_handler(support_command, commands=["support"])    
+    dp.register_message_handler(support_command, commands=["support"], state="*")
+    print("Обработчики поддержки зарегистрированы!")    

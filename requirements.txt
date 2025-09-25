@@ -8,3 +8,4 @@ openpyxl
 psycopg2-binary
 python-dotenv==1.0.0
 python-dateutil
+pandas
